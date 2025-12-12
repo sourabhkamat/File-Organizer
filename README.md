@@ -71,8 +71,6 @@ Organize Files >
 
 ⚠️ Disclaimer
 
-This is the very first build of My File-Organizer, so a few things might still act a little funny here and there.
-It can have some unknown error that i've not seen yet, but the "Undo Last Organization" button may not fully undo everything if you used "File Puller" on multiple folders at the same time.
+This is the very first build of My File-Organizer, so a few things might still behave a little unexpectedly. There may be some issues I haven’t discovered yet, and the “Undo Last Organization” feature might not fully undo everything if File Puller was used on multiple folders at once.
 
-Overall the app works fine, but small bugs or hiccups are still possible.
-If you notice anything weird, feel free to report it — it helps make the app better!
+Overall, the app works well, but small bugs or hiccups are still possible. If you notice anything odd, feel free to report it — it really helps improve the app!
