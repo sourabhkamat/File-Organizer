@@ -67,3 +67,14 @@ Organize Files >
     Undo Last Organize
     Manage File Types…
 ```
+
+
+⚠️ Disclaimer
+
+⚠️ Just a Heads-Up
+
+This is the very first build of My File-Organizer, so a few things might still act a little funny here and there.
+It can have some unknown error that i've not seen yet, but the "Undo Last Organization" button may not fully undo everything if you used "File Puller" on multiple folders at the same time.
+
+Overall the app works fine, but small bugs or hiccups are still possible.
+If you notice anything weird, feel free to report it — it helps make the app better!
