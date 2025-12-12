@@ -65,6 +65,5 @@ Organize Files >
           Move Files Out             # Only Appears on Selected Folders
     Delete Empty Folders
     Undo Last Organize
-    Multi Rename…
     Manage File Types…
 ```
