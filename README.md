@@ -18,12 +18,8 @@ Pinterest/
 Reddit/
 Pixabay/
 
-Works with any URL format, including:
-- https://www.pixabay.com/photo/xyz
-- img2.reddit.com/file.jpg
-- cdn.instagram.com/media/...
-
 Logic used:
+- Works with any URL format
 - Ignores prefixes like www., img2., images., cdn., i.
 - Extracts only the first meaningful domain segment
 - Removes domain suffixes like .com, .in, .co, .net
