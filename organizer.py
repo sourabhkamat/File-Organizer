@@ -3,21 +3,12 @@
 # NOTE: Keep this file simple and ASCII-only docstrings to avoid pyinstaller unicodeescape issues.
 
 from __future__ import annotations
-import os
-import sys
-import json
-import shutil
-import time
-import traceback
-import threading
-import re
+import ctypes, msvcrt
+import os, sys, json, shutil, time, traceback, re, subprocess
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Optional, Tuple
 from action_manage_gui import action_manage_gui
-
-
-
 
 # UI libs detection (used only for messageboxes)
 try:
@@ -80,8 +71,13 @@ def write_json(path: str, data) -> None:
 def ensure_appdata_defaults():
     base = get_base_dir()
     appdata = get_appdata_dir()
-    # Copy shipped defaults to AppData on first run
-    for name in ("default_presets.json", "user_presets.json", "last_action.json", "public_suffix_list.dat"):
+    for name in (
+        "default_presets.json",
+        "user_presets.json",
+        "public_suffix_list.dat",
+        "undo_stack.json",
+        "boot_count.txt",
+    ):
         src = os.path.join(base, name)
         dst = os.path.join(appdata, name)
         if not os.path.exists(dst) and os.path.exists(src):
@@ -89,13 +85,102 @@ def ensure_appdata_defaults():
                 shutil.copy2(src, dst)
             except Exception:
                 pass
-    # create last_action template if missing
-    la = appdata_file("last_action.json")
-    if not os.path.exists(la):
-        write_json(la, {"moves": [], "created_dirs": []})
-    up = appdata_file("user_presets.json")
-    if not os.path.exists(up):
-        write_json(up, {})
+    if not os.path.exists(appdata_file("undo_stack.json")):
+        write_json(appdata_file("undo_stack.json"), {})
+    if not os.path.exists(appdata_file("user_presets.json")):
+        write_json(appdata_file("user_presets.json"), {})
+
+# =====================================================
+# 🔁 BOOT SESSION DETECTION (NEW)
+# =====================================================
+def get_boot_id():
+    try:
+        GetTickCount64 = ctypes.windll.kernel32.GetTickCount64
+        GetTickCount64.restype = ctypes.c_ulonglong
+        uptime_ms = GetTickCount64()
+        # reboot = uptime resets → use coarse bucket
+        return int(uptime_ms // 1000)
+    except Exception:
+        return None
+
+
+def check_boot_session():
+    path = appdata_file("boot_id.txt")
+    current = get_boot_id()
+    if current is None:
+        return
+
+    try:
+        old = int(open(path).read().strip())
+    except Exception:
+        old = None
+
+    if old is None or current < old:
+        # reboot detected
+        write_json(appdata_file("undo_stack.json"), [])
+
+    with open(path, "w") as f:
+        f.write(str(current))
+
+
+# =====================================================
+# 🔁 UNDO STACK (NEW)
+# =====================================================
+def load_undo_stack() -> List[Dict[str, Any]]:
+    return read_json(appdata_file("undo_stack.json"), []) or []
+
+def save_undo_stack(stack: List[Dict[str, Any]]) -> None:
+    write_json(appdata_file("undo_stack.json"), stack)
+
+def push_undo_action(action: dict) -> None:
+    path = appdata_file("undo_stack.json")
+
+    # Ensure file exists
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[]")
+
+    with open(path, "r+", encoding="utf-8") as f:
+        # Ensure file has at least 1 byte for locking
+        f.seek(0, os.SEEK_END)
+        if f.tell() == 0:
+            f.write(" ")
+            f.flush()
+
+        # Lock the entire file
+        while True:
+            try:
+                f.seek(0)
+                size = max(1, os.path.getsize(path))
+                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, size)
+                break
+            except OSError:
+                time.sleep(0.01)
+
+        try:
+            # Read existing undo stack
+            f.seek(0)
+            try:
+                stack = json.load(f)
+                if not isinstance(stack, list):
+                    stack = []
+            except Exception:
+                stack = []
+
+            # Append new action
+            stack.append(action)
+
+            # Rewrite file safely
+            f.seek(0)
+            f.truncate()
+            json.dump(stack, f, indent=2)
+            f.flush()
+
+        finally:
+            # Unlock
+            f.seek(0)
+            size = max(1, os.path.getsize(path))
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, size)
 
 # ---------------- Safe move / collision ----------------
 def unique_dest(dest_dir: str, filename: str) -> str:
@@ -117,9 +202,7 @@ def is_ignored(path: str) -> bool:
     if name in IGNORE_FILENAMES:
         return True
     _, ext = os.path.splitext(name)
-    if ext.lower() in IGNORE_EXTENSIONS:
-        return True
-    return False
+    return ext.lower() in IGNORE_EXTENSIONS
 
 # ---------------- PSL helper ----------------
 class PublicSuffixList:
@@ -151,8 +234,6 @@ class PublicSuffixList:
         if re.match(r'^\d+(\.\d+){3}$', hostname) or hostname.startswith("[") or ":" in hostname:
             return None
         labels = hostname.split(".")
-        if not labels:
-            return None
         for ex in self.exceptions:
             if hostname.endswith(ex):
                 parts = hostname.split(".")
@@ -167,8 +248,7 @@ class PublicSuffixList:
             rule_parts = match.split(".")
             if len(labels) > len(rule_parts):
                 return ".".join(labels[-(len(rule_parts) + 1):])
-            else:
-                return hostname
+            return hostname
         if len(labels) >= 2:
             return ".".join(labels[-2:])
         return None
@@ -185,32 +265,22 @@ def get_hosturl_from_ads(path: str) -> Optional[str]:
         return None
     return None
 
-# ---------------- presets & last action ----------------
+# ---------------- presets ----------------
 def load_presets_merge() -> Dict[str, str]:
     users = read_json(appdata_file("user_presets.json"), {}) or {}
-    # Normalize keys to lower-case extensions
     return {k.lower(): v for k, v in users.items()}
-
-
-def load_last_action() -> Dict[str, Any]:
-    return read_json(appdata_file("last_action.json"), {"moves": [], "created_dirs": []})
-
-def save_last_action(data: Dict[str, Any]) -> None:
-    write_json(appdata_file("last_action.json"), data)
 
 # ---------------- Action: By Type ----------------
 def action_by_type(folder: str) -> int:
     if not os.path.isdir(folder):
         return 1
     presets = load_presets_merge()
-    items = [name for name in os.listdir(folder)]
     last = {"moves": [], "created_dirs": []}
     created = set()
-    for name in items:
+
+    for name in os.listdir(folder):
         f = os.path.join(folder, name)
-        if not os.path.isfile(f):
-            continue
-        if is_ignored(f):
+        if not os.path.isfile(f) or is_ignored(f):
             continue
         try:
             _, ext = os.path.splitext(name)
@@ -221,12 +291,13 @@ def action_by_type(folder: str) -> int:
                 if dest_dir not in created:
                     created.add(dest_dir)
                     last["created_dirs"].append(os.path.abspath(dest_dir))
-            dest = unique_dest(dest_dir, os.path.basename(f))
+            dest = unique_dest(dest_dir, name)
             safe_move(f, dest)
             last["moves"].append([os.path.abspath(f), os.path.abspath(dest)])
         except Exception:
             continue
-    save_last_action(last)
+
+    push_undo_action(last)
     return 0
 
 # ---------------- helpers for By Source parsing ----------------
@@ -242,12 +313,8 @@ def host_valid(hostname: Optional[str]) -> bool:
     return False
 
 def sanitize_folder_name(name: str) -> Optional[str]:
-    if not name:
-        return None
     cleaned = re.sub(r'[^A-Za-z0-9\-_\. ]', '', name).strip()
-    if not cleaned:
-        return None
-    return cleaned.capitalize()
+    return cleaned.capitalize() if cleaned else None
 
 def _parse_ads_domain_simple(path: str, psl: PublicSuffixList) -> Tuple[str, Optional[str]]:
     u = get_hosturl_from_ads(path)
@@ -264,11 +331,8 @@ def _parse_ads_domain_simple(path: str, psl: PublicSuffixList) -> Tuple[str, Opt
         if not registrable:
             return (path, None)
         labels = registrable.split(".")
-        if len(labels) < 2:
-            return (path, None)
-        main = labels[-2]
-        safe = sanitize_folder_name(main)
-        return (path, safe or None)
+        safe = sanitize_folder_name(labels[-2])
+        return (path, safe)
     except Exception:
         return (path, None)
 
@@ -277,13 +341,11 @@ def action_by_source(folder: str) -> int:
     if not os.path.isdir(folder):
         return 1
     files = [os.path.join(folder, f) for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
-    psl_path = appdata_file("public_suffix_list.dat")
-    if not os.path.exists(psl_path):
-        psl_path = os.path.join(get_base_dir(), "public_suffix_list.dat")
-    psl = PublicSuffixList(psl_path)
+    psl = PublicSuffixList(appdata_file("public_suffix_list.dat"))
     last = {"moves": [], "created_dirs": []}
     created = set()
-    results: List[Tuple[str, Optional[str]]] = []
+    results = []
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(_parse_ads_domain_simple, f, psl): f for f in files if not is_ignored(f)}
         for fut in as_completed(futures):
@@ -291,12 +353,10 @@ def action_by_source(folder: str) -> int:
                 results.append(fut.result())
             except Exception:
                 continue
+
     for f, domain in results:
         try:
-            if domain:
-                dest_dir = os.path.join(folder, domain)
-            else:
-                dest_dir = os.path.join(folder, "Unknown Sources")
+            dest_dir = os.path.join(folder, domain or "Unknown Sources")
             if not os.path.exists(dest_dir):
                 os.makedirs(dest_dir, exist_ok=True)
                 if dest_dir not in created:
@@ -307,7 +367,8 @@ def action_by_source(folder: str) -> int:
             last["moves"].append([os.path.abspath(f), os.path.abspath(dest)])
         except Exception:
             continue
-    save_last_action(last)
+
+    push_undo_action(last)
     return 0
 
 # ---------------- Action: Category (GUI + CLI) ----------------
@@ -315,14 +376,12 @@ def action_category_cli(folder: str, category: str) -> int:
     if not os.path.isdir(folder):
         return 1
     presets = load_presets_merge()
-    items = [name for name in os.listdir(folder)]
     last = {"moves": [], "created_dirs": []}
     created = set()
-    for name in items:
+
+    for name in os.listdir(folder):
         f = os.path.join(folder, name)
-        if not os.path.isfile(f):
-            continue
-        if is_ignored(f):
+        if not os.path.isfile(f) or is_ignored(f):
             continue
         _, ext = os.path.splitext(name)
         if presets.get(ext.lower()) == category:
@@ -332,13 +391,11 @@ def action_category_cli(folder: str, category: str) -> int:
                 if dest_dir not in created:
                     created.add(dest_dir)
                     last["created_dirs"].append(os.path.abspath(dest_dir))
-            try:
-                dest = unique_dest(dest_dir, os.path.basename(f))
-                safe_move(f, dest)
-                last["moves"].append([os.path.abspath(f), os.path.abspath(dest)])
-            except Exception:
-                continue
-    save_last_action(last)
+            dest = unique_dest(dest_dir, name)
+            safe_move(f, dest)
+            last["moves"].append([os.path.abspath(f), os.path.abspath(dest)])
+
+    push_undo_action(last)
     return 0
 
 def action_category_gui(folder: str) -> int:
@@ -370,153 +427,190 @@ def action_category_gui(folder: str) -> int:
 # ---------------- Action: File Puller ----------------
 def action_file_puller(paths: List[str], mode: str = "all") -> int:
     last = {"moves": [], "created_dirs": []}
-    created = set()
 
     for p in paths:
-        if not os.path.exists(p):
-            continue
-        if os.path.isfile(p):
+        if not os.path.isdir(p):
             continue
 
-        # -------------------------
-        # NEW MODE: pull_above
-        # -------------------------
+        # Snapshot files FIRST (critical)
+        files_to_move = []
+        for root, _, files in os.walk(p):
+            for fname in files:
+                src = os.path.join(root, fname)
+                if is_ignored(src):
+                    continue
+                files_to_move.append(src)
+
+        if not files_to_move:
+            continue
+
         if mode == "above":
-            # Get parent folder of the selected folder
             parent = os.path.dirname(p)
             if not parent:
-                continue  # cannot pull above root
+                continue
 
-            for root, dirs, files in os.walk(p):
-                for fname in files:
-                    src = os.path.join(root, fname)
-                    if is_ignored(src):
-                        continue
-                    try:
-                        dest = unique_dest(parent, fname)
-                        safe_move(src, dest)
-                        last["moves"].append([
-                            os.path.abspath(src),
-                            os.path.abspath(dest)
-                        ])
-                    except Exception:
-                        continue
+            for src in files_to_move:
+                dest = unique_dest(parent, os.path.basename(src))
+                safe_move(src, dest)
+                last["moves"].append([os.path.abspath(src), os.path.abspath(dest)])
 
-            # nothing created here, so skip to next path
-            continue
+        elif mode == "here":
+            for src in files_to_move:
+                if os.path.dirname(src) == p:
+                    continue
+                dest = unique_dest(p, os.path.basename(src))
+                safe_move(src, dest)
+                last["moves"].append([os.path.abspath(src), os.path.abspath(dest)])
 
-        # -------------------------
-        # EXISTING MODE: here
-        # -------------------------
-        if mode == "here":
-            root_folder = p
-            for root, dirs, files in os.walk(root_folder):
-                for fname in files:
-                    src = os.path.join(root, fname)
-                    if is_ignored(src):
-                        continue
-                    # skip files already in root_folder
-                    if os.path.dirname(src) == root_folder:
-                        continue
-                    try:
-                        dest = unique_dest(root_folder, fname)
-                        safe_move(src, dest)
-                        last["moves"].append([
-                            os.path.abspath(src),
-                            os.path.abspath(dest)
-                        ])
-                    except Exception:
-                        continue
-
-        # -------------------------
-        # EXISTING MODE: all
-        # -------------------------
-        else:
+        else:  # mode == "all"
             parent = os.path.dirname(p) or p
             dest_dir = os.path.join(parent, "Files Bin")
-
             if not os.path.exists(dest_dir):
                 os.makedirs(dest_dir, exist_ok=True)
-                created.add(dest_dir)
                 last["created_dirs"].append(os.path.abspath(dest_dir))
 
-            for root, dirs, files in os.walk(p):
-                for fname in files:
-                    src = os.path.join(root, fname)
-                    if is_ignored(src):
-                        continue
-                    try:
-                        dest = unique_dest(dest_dir, fname)
-                        safe_move(src, dest)
-                        last["moves"].append([
-                            os.path.abspath(src),
-                            os.path.abspath(dest)
-                        ])
-                    except Exception:
-                        continue
+            for src in files_to_move:
+                dest = unique_dest(dest_dir, os.path.basename(src))
+                safe_move(src, dest)
+                last["moves"].append([os.path.abspath(src), os.path.abspath(dest)])
 
-    save_last_action(last)
-    return 0
+    # Only push undo if something actually happened
+    if last["moves"] or last["created_dirs"]:
+        push_undo_action(last)
+        return 0
+
+    return 1
+
+
 # ---------------- Delete Empty Folders ----------------
 def action_delete_empty(folder: str) -> int:
     if not os.path.isdir(folder):
         return 1
-    for root, dirs, files in os.walk(folder, topdown=False):
-        try:
+
+    folder = os.path.abspath(folder)
+
+    # If send2trash is not available, do NOT delete anything
+    if not SEND2TRASH:
+        return 1
+
+    while True:
+        deleted_any = False
+
+        for root, dirs, files in os.walk(folder, topdown=False):
+            # Never delete the root folder itself
+            if root == folder:
+                continue
+
             if not dirs and not files:
                 try:
-                    if SEND2TRASH:
-                        send2trash(root)
-                    else:
-                        os.rmdir(root)
+                    send2trash(root)   # Move to Recycle Bin
+                    deleted_any = True
                 except Exception:
-                    try:
-                        os.rmdir(root)
-                    except Exception:
-                        continue
-        except Exception:
-            continue
+                    # Locked / permission denied → skip
+                    pass
+
+        if not deleted_any:
+            break
+
     return 0
 
-# ---------------- Undo ----------------
+
+# ---------------- Undo (Explorer-like, multi-level) ----------------
 def action_undo(context: Optional[str] = None) -> int:
-    last = load_last_action()
-    moves = last.get("moves", [])
-    created = last.get("created_dirs", [])
-    for src, dst in reversed(moves):
+    stack = load_undo_stack()
+    if not stack:
+        return 1
+
+    action = stack.pop()
+
+    for src, dst in reversed(action.get("moves", [])):
         try:
-            if os.path.exists(dst):
-                parent = os.path.dirname(src)
-                os.makedirs(parent, exist_ok=True)
-                final = src
-                if os.path.exists(src):
-                    base, ext = os.path.splitext(src)
-                    i = 1
+            if not os.path.exists(dst):
+                continue
+            os.makedirs(os.path.dirname(src), exist_ok=True)
+            final = src
+            if os.path.exists(src):
+                base, ext = os.path.splitext(src)
+                i = 1
+                while True:
                     candidate = f"{base} (restored {i}){ext}"
-                    while os.path.exists(candidate):
-                        i += 1
-                        candidate = f"{base} (restored {i}){ext}"
-                    final = candidate
-                safe_move(dst, final)
+                    if not os.path.exists(candidate):
+                        final = candidate
+                        break
+                    i += 1
+            safe_move(dst, final)
         except Exception:
             continue
-    for d in sorted(created, key=lambda x: len(x.split(os.sep)), reverse=True):
+
+    for d in sorted(action.get("created_dirs", []), key=len, reverse=True):
         try:
             if os.path.isdir(d) and not os.listdir(d):
                 os.rmdir(d)
         except Exception:
             continue
-    save_last_action({"moves": [], "created_dirs": []})
+
+    save_undo_stack(stack)
     return 0
+
+# ---------------- Undo all at once ----------------
+
+def action_undo_all() -> int:
+    stack = load_undo_stack()
+    if not stack:
+        return 1
+
+    # Undo actions in reverse order (latest → oldest)
+    while stack:
+        action = stack.pop()
+
+        # Undo file moves
+        for src, dst in reversed(action.get("moves", [])):
+            try:
+                if not os.path.exists(dst):
+                    continue
+
+                os.makedirs(os.path.dirname(src), exist_ok=True)
+                final = src
+
+                if os.path.exists(src):
+                    base, ext = os.path.splitext(src)
+                    i = 1
+                    while True:
+                        candidate = f"{base} (restored {i}){ext}"
+                        if not os.path.exists(candidate):
+                            final = candidate
+                            break
+                        i += 1
+
+                safe_move(dst, final)
+            except Exception:
+                continue
+
+        # Remove empty created folders
+        for d in sorted(action.get("created_dirs", []), key=len, reverse=True):
+            try:
+                if os.path.isdir(d) and not os.listdir(d):
+                    os.rmdir(d)
+            except Exception:
+                continue
+
+    # Clear undo stack completely
+    save_undo_stack([])
+    return 0
+
 
 # ---------------- CLI Entrypoint ----------------
 def main(argv: List[str]) -> int:
     ensure_appdata_defaults()
+    check_boot_session()
+
     if len(argv) < 2:
         print("Usage: organizer.exe <action> <path1> <path2> ...")
         return 1
+
     action = argv[1].lower()
     args = argv[2:]
+
     try:
         if action == "type":
             return action_by_type(args[0]) if args else 1
@@ -532,14 +626,14 @@ def main(argv: List[str]) -> int:
             return action_file_puller(args, mode="all")
         elif action == "pull_above":
             return action_file_puller(args, mode="above")
-        elif action == "folder_for_selection":
-            return action_folder_for_selection(args)
         elif action == "delete_empty":
             return action_delete_empty(args[0]) if args else 1
         elif action == "manage":
             return action_manage_gui()
         elif action == "undo":
-            return action_undo(args[0] if args else None)
+            return action_undo()
+        elif action == "undo_all":
+            return action_undo_all()
         else:
             print("Unknown action:", action)
             return 2
@@ -550,11 +644,7 @@ def main(argv: List[str]) -> int:
         except Exception:
             pass
         try:
-            if CTK_AVAILABLE:
-                tkmb = __import__("tkinter.messagebox").messagebox
-                tkmb.showerror("Error", f"An error occurred: {e}")
-            else:
-                messagebox.showerror("Error", f"An error occurred: {e}")
+            messagebox.showerror("Error", f"An error occurred: {e}")
         except Exception:
             pass
         return 3
