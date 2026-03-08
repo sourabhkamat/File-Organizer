@@ -4,7 +4,7 @@ import os, json, re
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import customtkinter as ctk
-from typing import Dict
+from typing import Dict, List, Tuple
 
 APPDATA_SUBDIR = "File Organizer"
 
@@ -46,14 +46,20 @@ class ManageSpreadsheet(ctk.CTk):
         self.user_path = appdata_file("user_presets.json")
 
         raw = read_json(self.user_path)
-        self.combined: Dict[str, str] = {
-            k.lstrip(".").lower(): v for k, v in raw.items()
-        }
+        self.cat_to_exts: Dict[str, List[str]] = {}
+        
+        for k, v in raw.items():
+            ext = k.lstrip(".").lower()
+            cats = [c.strip() for c in v.split("|")] if isinstance(v, str) else v
+            if not isinstance(cats, list): cats = [cats]
+            for cat in cats:
+                if cat not in self.cat_to_exts:
+                    self.cat_to_exts[cat] = []
+                if ext not in self.cat_to_exts[cat]:
+                    self.cat_to_exts[cat].append(ext)
 
-        # 🔑 SORT ONLY ONCE AT STARTUP
-        self.combined = dict(
-            sorted(self.combined.items(), key=lambda i: i[1].lower())
-        )
+        self.sort_col = "c"
+        self.sort_rev = False
 
         self._setup_styles()
         self._build_layout()
@@ -140,7 +146,11 @@ class ManageSpreadsheet(ctk.CTk):
         vs.grid(row=0, column=1, sticky="ns")
 
         table.grid_rowconfigure(0, weight=1)
-        table.grid_columnconfigure(0, weight=1)
+        self.tree.grid_columnconfigure(0, weight=1)
+
+        # Bind headings for sorting
+        self.tree.heading("e", text="Extensions", command=lambda: self._sort_column("e", False))
+        self.tree.heading("c", text="Category", command=lambda: self._sort_column("c", False))
 
         right = ctk.CTkFrame(main, width=75)
         right.pack(side="right", fill="y", padx=6)
@@ -161,16 +171,22 @@ class ManageSpreadsheet(ctk.CTk):
     # ------------------ Load Rows ------------------
     def _load_rows(self):
         self.tree.delete(*self.tree.get_children())
-        grouped = {}
-        for ext, cat in self.combined.items():
-            grouped.setdefault(cat, []).append(ext)
-
+        
+        wl_cats = {c: e for c, e in self.cat_to_exts.items() if c.lower().startswith("whitelist.")}
+        norm_cats = {c: e for c, e in self.cat_to_exts.items() if not c.lower().startswith("whitelist.")}
+        
+        def sort_dict(d):
+            if self.sort_col == "e":
+                return sorted(d.items(), key=lambda item: item[1][0] if item[1] else "", reverse=self.sort_rev)
+            else:
+                return sorted(d.items(), key=lambda item: item[0].lower(), reverse=self.sort_rev)
+                
+        cats_to_render = sort_dict(wl_cats) + sort_dict(norm_cats)
+        
         idx = 1
-        for cat, exts in grouped.items():
+        for cat, exts in cats_to_render:
             tag = "even" if idx % 2 == 0 else "odd"
-            self.tree.insert("", "end",
-                             values=(idx, ", ".join(exts), cat),
-                             tags=(tag,))
+            self.tree.insert("", "end", values=(idx, ", ".join(exts), cat), tags=(tag,))
             idx += 1
 
         tag = "even" if idx % 2 == 0 else "odd"
@@ -179,28 +195,37 @@ class ManageSpreadsheet(ctk.CTk):
     # ------------------ Search ------------------
     def _search(self):
         q = self.search_var.get().strip().lower()
-        self.tree.delete(*self.tree.get_children())
-
         if not q:
             self._load_rows()
             return
-
-        matched = {cat for ext, cat in self.combined.items()
-                   if q in ext or q in cat.lower()}
-
-        grouped = {}
-        for ext, cat in self.combined.items():
-            if cat in matched:
-                grouped.setdefault(cat, []).append(ext)
-
-        idx = 1
-        for cat, exts in grouped.items():
-            tag = "even" if idx % 2 == 0 else "odd"
-            self.tree.insert("", "end",
-                             values=(idx, ", ".join(exts), cat), tags=(tag,))
-            idx += 1
+            
+        self.tree.delete(*self.tree.get_children())
         
-        self.tree.insert("", "end", values=(idx, "", ""))
+        matched_cats = {}
+        for cat, exts in self.cat_to_exts.items():
+            matching_exts = [e for e in exts if q in e]
+            if q in cat.lower() or matching_exts:
+                matched_cats[cat] = exts
+
+        wl_cats = {c: e for c, e in matched_cats.items() if c.lower().startswith("whitelist.")}
+        norm_cats = {c: e for c, e in matched_cats.items() if not c.lower().startswith("whitelist.")}
+        
+        def sort_dict(d):
+            if self.sort_col == "e":
+                return sorted(d.items(), key=lambda item: item[1][0] if item[1] else "", reverse=self.sort_rev)
+            else:
+                return sorted(d.items(), key=lambda item: item[0].lower(), reverse=self.sort_rev)
+                
+        cats_to_render = sort_dict(wl_cats) + sort_dict(norm_cats)
+        
+        idx = 1
+        for cat, exts in cats_to_render:
+            tag = "even" if idx % 2 == 0 else "odd"
+            self.tree.insert("", "end", values=(idx, ", ".join(exts), cat), tags=(tag,))
+            idx += 1
+            
+        tag = "even" if idx % 2 == 0 else "odd"
+        self.tree.insert("", "end", values=(idx, "", ""), tags=(tag,))
 
         
 
@@ -261,23 +286,39 @@ class ManageSpreadsheet(ctk.CTk):
             exts = self.tree.set(rowid, "e").strip()
             cat = self.tree.set(rowid, "c").strip()
 
+            is_new_row = rowid == self.tree.get_children()[-1]
+
             if not exts or not cat:
+                # Revert visually if left blank on an existing row
+                if not is_new_row:
+                    self.tree.set(rowid, key, old_val)
                 return
 
             parts = [p for p in (x.strip() for x in exts.split(",")) if p]
 
-            is_new_row = rowid == self.tree.get_children()[-1]
-
             # ---------- Update data model ----------
-            if is_new_row:
+            if not cat.lower().startswith("whitelist."):
                 for p in parts:
-                    self.combined[p] = cat
-            else:
-                for k in list(self.combined):
-                    if self.combined[k] == old_cat and k not in parts:
-                        self.combined.pop(k)
-                for p in parts:
-                    self.combined[p] = cat
+                    for exist_cat, exist_exts in self.cat_to_exts.items():
+                        if exist_cat != old_cat and not exist_cat.lower().startswith("whitelist.") and p in exist_exts:
+                            messagebox.showerror("Conflict", f"Extension '{p}' is already inside '{exist_cat}'.\n\nExtensions can only belong to one normal category.")
+                            self.tree.set(rowid, key, old_val)
+                            return
+                            
+            if not is_new_row and old_cat in self.cat_to_exts:
+                self.cat_to_exts.pop(old_cat, None)
+                
+            if cat not in self.cat_to_exts:
+                self.cat_to_exts[cat] = []
+                
+            for p in parts:
+                if p not in self.cat_to_exts[cat]:
+                    self.cat_to_exts[cat].append(p)
+                    
+            if not self.cat_to_exts[cat]:
+                self.cat_to_exts.pop(cat, None)
+                
+            self._load_rows()
 
             # ---------- Ensure trailing empty row ----------
             children = self.tree.get_children()
@@ -317,9 +358,9 @@ class ManageSpreadsheet(ctk.CTk):
             return
         if not messagebox.askyesno("Confirm Delete", "Delete selected preset?"):
             return
-        exts = self.tree.set(sel[0], "e")
-        for e in exts.split(","):
-            self.combined.pop(e.strip(), None)
+        cat = self.tree.set(sel[0], "c")
+        if cat in self.cat_to_exts:
+            self.cat_to_exts.pop(cat)
         self._load_rows()
 
     def _on_delete_all(self):
@@ -333,7 +374,7 @@ class ManageSpreadsheet(ctk.CTk):
             return
 
         # clear data model
-        self.combined.clear()
+        self.cat_to_exts.clear()
 
         # clear UI
         self.tree.delete(*self.tree.get_children())
@@ -351,7 +392,13 @@ class ManageSpreadsheet(ctk.CTk):
         if not messagebox.askyesno("Reset Presets", "Reset to defaults?"):
             return
         raw = read_json(self.default_path)
-        self.combined = {k.lstrip(".").lower(): v for k, v in raw.items()}
+        self.cat_to_exts.clear()
+        for k, v in raw.items():
+            ext = k.lstrip(".").lower()
+            cats = [c.strip() for c in v.split("|")] if isinstance(v, str) else v
+            for cat in cats:
+                if ext not in self.cat_to_exts.setdefault(cat, []):
+                    self.cat_to_exts[cat].append(ext)
         self.search_var.set("")
         self._load_rows()
 
@@ -361,20 +408,41 @@ class ManageSpreadsheet(ctk.CTk):
             return
         raw = read_json(path)
         for k, v in raw.items():
-            self.combined[k.lstrip(".").lower()] = v
+            ext = k.lstrip(".").lower()
+            cats = [c.strip() for c in v.split("|")] if isinstance(v, str) else v
+            for cat in cats:
+                if ext not in self.cat_to_exts.setdefault(cat, []):
+                    self.cat_to_exts[cat].append(ext)
         self._load_rows()
+
+    def _get_export_dict(self):
+        ext_to_cats = {}
+        for cat, exts in self.cat_to_exts.items():
+            for ext in exts:
+                ext_to_cats.setdefault(ext, []).append(cat)
+                
+        out = {}
+        for ext, cats in ext_to_cats.items():
+            out[f".{ext}"] = "|".join(cats)
+        return out
 
     def _on_export(self):
         path = filedialog.asksaveasfilename(defaultextension=".json")
         if not path:
             return
-        write_json(path, {f".{k}": v for k, v in self.combined.items()})
+        write_json(path, self._get_export_dict())
 
     def _on_save(self):
         if not messagebox.askyesno("Save Presets", "Save current presets?"):
             return
-        write_json(self.user_path, {f".{k}": v for k, v in self.combined.items()})
+        write_json(self.user_path, self._get_export_dict())
         messagebox.showinfo("Saved", "Presets saved successfully.")
+
+    def _sort_column(self, col, reverse):
+        self.sort_col = col
+        self.sort_rev = reverse
+        self._load_rows()
+        self.tree.heading(col, command=lambda: self._sort_column(col, not reverse))
 
 # ------------------ Run ------------------
 def action_manage_gui():
