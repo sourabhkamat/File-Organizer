@@ -90,6 +90,7 @@
   ".tif": "Images",
   ".tiff": "Images",
   ".webp": "Images",
+  ".dng": "Raw Image",
   ".mgjson": "Motion Graphics JSON",
   ".mogrt": "Motion Graphics Templates",
   ".psdc": "Photoshop Cloud Projects",
@@ -189,5 +190,7 @@
   ".ts": "Web",
   ".tsx": "Web",
   ".vue": "Web",
-  ".xml": "Web"
+  ".xml": "Web",
+  ".folder": "whitelist.Desktop",
+  ".lnk": "whitelist.Desktop"
 }
